@@ -6,6 +6,12 @@ Supports:
   - Geometry slice tiling (medium meshes, single GPU)
   - Geometry amortized training (large meshes, subset per iteration)
   - Physical state caching + full mesh decoding (inference on industrial-scale meshes)
+
+Fixes vs initial implementation:
+  - #4: _cache_chunked streams chunks one at a time on GPU, offloading
+        intermediate features to CPU. Never stores all N features on GPU.
+  - #5: get_grid uses fixed [0,1] linspace, so it's chunk-safe by design.
+  - #6: Mixed precision via torch.amp autocast context manager.
 """
 
 import math
@@ -34,6 +40,7 @@ class Transolver3(nn.Module):
                  ref=8,
                  unified_pos=False,
                  num_tiles=0,
+                 mlp_chunk_size=0,
                  ):
         super(Transolver3, self).__init__()
         self.__name__ = 'Transolver3'
@@ -68,6 +75,7 @@ class Transolver3(nn.Module):
                 out_dim=out_dim,
                 slice_num=slice_num,
                 last_layer=(i == n_layers - 1),
+                mlp_chunk_size=mlp_chunk_size,
             )
             for i in range(n_layers)
         ])
@@ -90,7 +98,11 @@ class Transolver3(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def get_grid(self, x, batchsize=1):
-        """Compute distance-based positional encoding from a reference grid."""
+        """Compute distance-based positional encoding from a reference grid.
+
+        Fix #5: Uses fixed [0,1] linspace for the reference grid, making it
+        chunk-safe — the reference grid is independent of input min/max.
+        """
         gridx = torch.tensor(np.linspace(0, 1, self.ref), dtype=torch.float)
         gridx = gridx.reshape(1, self.ref, 1, 1).repeat([batchsize, 1, self.ref, 1])
         gridy = torch.tensor(np.linspace(0, 1, self.ref), dtype=torch.float)
@@ -161,6 +173,10 @@ class Transolver3(nn.Module):
         Processes the mesh in chunks if chunk_size is specified, accumulating
         physical states layer-by-layer per paper Figure 3(a).
 
+        Fix #4: When chunked, intermediate features are offloaded to CPU
+        between layers. Only one chunk is on GPU at a time, so GPU memory
+        is O(chunk_size * hidden_dim) not O(N * hidden_dim).
+
         Args:
             x: (B, N, space_dim) full mesh coordinates
             fx: (B, N, fun_dim) optional full mesh features
@@ -170,15 +186,13 @@ class Transolver3(nn.Module):
                        for memory-efficient state accumulation
 
         Returns:
-            cache: list of (s_out, ) tensors, one per layer
+            cache: list of s_out tensors, one per layer
         """
         N = x.shape[1]
 
         if chunk_size is None or chunk_size >= N:
-            # Process full mesh at once
             return self._cache_full(x, fx, T, num_tiles)
         else:
-            # Process in chunks, accumulating states
             return self._cache_chunked(x, fx, T, num_tiles, chunk_size)
 
     @torch.no_grad()
@@ -188,57 +202,67 @@ class Transolver3(nn.Module):
         cache = []
 
         for block in self.blocks:
-            # Compute and cache the physical state for this layer
             s_raw, d = block.compute_physical_state(fx_current)
             s_out = block.compute_cached_state(s_raw, d)
             cache.append(s_out)
-            # Advance fx through this layer
             fx_current = block(fx_current, num_tiles=num_tiles)
 
         return cache
 
     @torch.no_grad()
     def _cache_chunked(self, x, fx, T, num_tiles, chunk_size):
-        """Cache states by processing the mesh in chunks.
+        """Cache states by streaming chunks through the model.
 
-        For each layer, accumulate s_raw and d across all chunks,
-        then compute the final cached state.
+        Fix #4: Instead of storing all preprocessed features on GPU,
+        intermediate chunk features are kept on CPU. Only one chunk
+        is moved to GPU at a time for processing.
+
+        Memory: O(chunk_size * hidden_dim) GPU + O(N * hidden_dim) CPU
+        instead of O(N * hidden_dim) GPU.
         """
         B, N, _ = x.shape
         num_chunks = math.ceil(N / chunk_size)
+        device = x.device
 
-        # Preprocess all chunks (needed for layer-by-layer processing)
-        # Store preprocessed features per chunk
-        chunks_fx = []
+        # Step 1: Preprocess each chunk, storing results on CPU
+        chunks_fx_cpu = []
         for k in range(num_chunks):
             start = k * chunk_size
             end = min(start + chunk_size, N)
             x_k = x[:, start:end]
             fx_k = fx[:, start:end] if fx is not None else None
-            chunks_fx.append(self._preprocess(x_k, fx_k, T))
+            chunk_fx = self._preprocess(x_k, fx_k, T)
+            chunks_fx_cpu.append(chunk_fx.cpu())
+            del chunk_fx  # free GPU memory
 
         cache = []
         for layer_idx, block in enumerate(self.blocks):
-            # Accumulate s_raw and d across chunks for this layer
+            # Phase A: Accumulate s_raw and d across chunks
             s_raw_accum = None
             d_accum = None
 
             for k in range(num_chunks):
-                s_raw_k, d_k = block.compute_physical_state(chunks_fx[k])
+                chunk_fx_gpu = chunks_fx_cpu[k].to(device)
+                s_raw_k, d_k = block.compute_physical_state(chunk_fx_gpu)
                 if s_raw_accum is None:
                     s_raw_accum = s_raw_k
                     d_accum = d_k
                 else:
                     s_raw_accum = s_raw_accum + s_raw_k
                     d_accum = d_accum + d_k
+                del chunk_fx_gpu  # free GPU memory
 
             # Finalize cached state for this layer
             s_out = block.compute_cached_state(s_raw_accum, d_accum)
             cache.append(s_out)
+            del s_raw_accum, d_accum
 
-            # Advance all chunks through this layer
+            # Phase B: Advance all chunks through this layer, storing on CPU
             for k in range(num_chunks):
-                chunks_fx[k] = block(chunks_fx[k], num_tiles=num_tiles)
+                chunk_fx_gpu = chunks_fx_cpu[k].to(device)
+                advanced = block(chunk_fx_gpu, num_tiles=num_tiles)
+                chunks_fx_cpu[k] = advanced.cpu()
+                del chunk_fx_gpu, advanced  # free GPU memory
 
         return cache
 
@@ -292,7 +316,6 @@ class Transolver3(nn.Module):
 
         N = x.shape[1]
         if decode_chunk_size is None or decode_chunk_size >= N:
-            # Decode all at once
             return self.decode_from_cache(x, cache, fx_query=fx, T=T)
 
         # Phase 2: Decode in chunks

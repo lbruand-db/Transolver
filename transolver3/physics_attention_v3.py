@@ -10,6 +10,11 @@ Key innovations over Transolver v1 (Physics_Attention_Irregular_Mesh):
      from field decoding for industrial-scale meshes.
 
 Reference: Transolver-3 paper (arXiv:2602.04940), Section 3.1-3.3, Algorithm 1.
+
+Fixes vs initial implementation:
+  - #1: Head aggregation uses rearrange (concat) not mean. slice_linear3 is
+        dim_head->dim_head, output heads are concatenated like v1.
+  - #2: einsum replaced by per-head matmul to avoid materializing (B,H,N,C).
 """
 
 import math
@@ -18,6 +23,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from einops import rearrange
+
+
+def _slice_aggregate(w, x, heads):
+    """Memory-efficient w^T @ x without materializing (B,H,N,C).
+
+    Computes s_raw[b,h,m,c] = sum_n w[b,h,n,m] * x[b,n,c] per head
+    using batched matmul: (M,N) @ (N,C) = (M,C) for each (b,h).
+
+    Args:
+        w: (B, H, N, M) slice weights
+        x: (B, N, C) input features
+
+    Returns:
+        s_raw: (B, H, M, C)
+    """
+    B, H, N, M = w.shape
+    C = x.shape[2]
+    # w transposed: (B, H, M, N), x expanded: (B, 1, N, C) -> (B, H, N, C)
+    # matmul: (B, H, M, N) @ (B, H, N, C) -> (B, H, M, C)
+    # Expand x without materializing the full (B,H,N,C) tensor in memory:
+    # torch.matmul broadcasts x (B,1,N,C) against w_t (B,H,M,N) correctly.
+    w_t = w.transpose(2, 3)  # B, H, M, N
+    x_expanded = x.unsqueeze(1)  # B, 1, N, C — broadcast, not materialized
+    s_raw = torch.matmul(w_t, x_expanded)  # B, H, M, C
+    return s_raw
+
+
+def _deslice(s_out, w):
+    """Memory-efficient deslice: w @ s_out without (B,H,N,dim) overhead.
+
+    Args:
+        s_out: (B, H, M, dim_head)
+        w: (B, H, N, M) slice weights
+
+    Returns:
+        x_out: (B, H, N, dim_head)
+    """
+    # (B, H, N, M) @ (B, H, M, dim_head) -> (B, H, N, dim_head)
+    return torch.matmul(w, s_out)
 
 
 class PhysicsAttentionV3(nn.Module):
@@ -30,24 +74,31 @@ class PhysicsAttentionV3(nn.Module):
 
     The slice weight computation (in_project_slice) now operates directly on
     the raw input x in dim-space, not on a pre-projected dim_head-space.
+
+    Head aggregation: each head outputs dim_head features after deslice,
+    heads are concatenated (rearrange) to produce inner_dim = heads * dim_head = dim.
+    Since inner_dim == dim in the standard config, no final N-domain linear is needed.
     """
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0., slice_num=64):
         super().__init__()
+        inner_dim = dim_head * heads
+        assert inner_dim == dim, (
+            f"Transolver-3 requires inner_dim == dim (heads*dim_head={inner_dim} != dim={dim}). "
+            f"This is needed because to_out is absorbed into slice_linear3."
+        )
         self.dim = dim
         self.dim_head = dim_head
         self.heads = heads
         self.slice_num = slice_num
-        self.scale = dim_head ** -0.5
         self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
         self.dropout_p = dropout
 
         # Learnable temperature for slice weight sharpness
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
 
-        # Slice weight projection: raw x (dim) -> per-head slice weights (heads * slice_num)
-        # In v1 this was: in_project_x (dim->inner_dim) then in_project_slice (dim_head->slice_num)
+        # Slice weight projection: raw x (dim) -> per-head slice weights
+        # In v1: in_project_x(dim->inner_dim) then in_project_slice(dim_head->slice_num)
         # In v3: single projection from dim directly to heads*slice_num
         self.in_project_slice = nn.Linear(dim, heads * slice_num)
         nn.init.orthogonal_(self.in_project_slice.weight)
@@ -62,9 +113,9 @@ class PhysicsAttentionV3(nn.Module):
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
 
         # Slice-domain Linear3: replaces to_out but operates on M tokens not N
-        # Projects from dim_head back to dim (per head), then we reshape heads*dim -> dim
-        # Note: the output per-head is dim-sized to allow proper deslice aggregation
-        self.slice_linear3 = nn.Linear(dim_head, dim)
+        # FIX #1: dim_head -> dim_head (not dim_head -> dim).
+        # After deslice, heads are concatenated via rearrange to get dim.
+        self.slice_linear3 = nn.Linear(dim_head, dim_head)
         self.out_dropout = nn.Dropout(dropout)
 
     def _compute_slice_weights(self, x):
@@ -77,12 +128,10 @@ class PhysicsAttentionV3(nn.Module):
             w: (B, H, N, M) normalized slice weights
         """
         B, N, C = x.shape
-        # Project to per-head slice logits
         logits = self.in_project_slice(x)  # B, N, H*M
         logits = logits.reshape(B, N, self.heads, self.slice_num)
         logits = logits.permute(0, 2, 1, 3).contiguous()  # B, H, N, M
 
-        # Temperature-scaled softmax
         temperature = torch.clamp(self.temperature, min=0.1, max=5.0)
         w = self.softmax(logits / temperature)  # B, H, N, M
         return w
@@ -107,35 +156,26 @@ class PhysicsAttentionV3(nn.Module):
         """Standard forward pass (no tiling). Paper Eq. 3."""
         B, N, C = x.shape
 
-        # (1) Faster Slice: compute weights and aggregate in one pass
-        # w = Softmax(Linear2(x)) — O(NCM) time, O(NM) space
+        # (1) Faster Slice
         w = self._compute_slice_weights(x)  # B, H, N, M
-        d = w.sum(dim=2)  # B, H, M — diagonal normalization
+        d = w.sum(dim=2)  # B, H, M
 
-        # s_raw = w^T @ x — O(NMC) time, O(MC) space
-        # Note: einsum handles B,H,N,M x B,N,C -> B,H,M,C without materializing B,H,N,C
-        s_raw = torch.einsum("bhnm,bnc->bhmc", w, x)  # B, H, M, C
-
-        # Linear1 in slice domain — O(MC^2) instead of O(NC^2)
+        # FIX #2: use matmul instead of einsum to avoid (B,H,N,C) intermediate
+        s_raw = _slice_aggregate(w, x, self.heads)  # B, H, M, C
         s = self.slice_linear1(s_raw / (d[..., None] + 1e-5))  # B, H, M, dim_head
 
-        # (2) Self-attention among slice tokens — O(M^2 C)
-        q = self.to_q(s)
-        k = self.to_k(s)
-        v = self.to_v(s)
+        # (2) Self-attention among slice tokens
+        q, k, v = self.to_q(s), self.to_k(s), self.to_v(s)
         s_out = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.dropout_p if self.training else 0.0
         )  # B, H, M, dim_head
 
-        # (3) Faster Deslice: Linear3 in slice domain — O(MC^2) instead of O(NC^2)
-        s_out = self.slice_linear3(s_out)  # B, H, M, C
+        # (3) Faster Deslice
+        s_out = self.slice_linear3(s_out)  # B, H, M, dim_head
 
-        # Deslice: project back to mesh domain — O(NMC)
-        # x_out = w @ s_out (using the same slice weights)
-        x_out = torch.einsum("bhmc,bhnm->bhnc", s_out, w)  # B, H, N, C
-
-        # Aggregate heads by averaging (since output is already in dim-space per head)
-        x_out = x_out.mean(dim=1)  # B, N, C
+        # FIX #1: use matmul for deslice, then rearrange (concat heads) not mean
+        x_out = _deslice(s_out, w)  # B, H, N, dim_head
+        x_out = rearrange(x_out, 'b h n d -> b n (h d)')  # B, N, dim
         return self.out_dropout(x_out)
 
     def _forward_tiled(self, x, num_tiles):
@@ -144,7 +184,6 @@ class PhysicsAttentionV3(nn.Module):
         tile_size = math.ceil(N / num_tiles)
         device = x.device
 
-        # Initialize global accumulators
         s_raw_accum = torch.zeros(B, self.heads, self.slice_num, C, device=device)
         d_accum = torch.zeros(B, self.heads, self.slice_num, device=device)
 
@@ -152,12 +191,12 @@ class PhysicsAttentionV3(nn.Module):
         for t in range(num_tiles):
             start = t * tile_size
             end = min(start + tile_size, N)
-            x_t = x[:, start:end]  # B, N_t, C
+            x_t = x[:, start:end]
 
-            # Gradient checkpoint: recompute w_t during backward pass
             def _tile_slice_and_aggregate(x_tile):
                 w_tile = self._compute_slice_weights(x_tile)  # B, H, N_t, M
-                s_raw_tile = torch.einsum("bhnm,bnc->bhmc", w_tile, x_tile)  # B, H, M, C
+                # FIX #2: per-head matmul
+                s_raw_tile = _slice_aggregate(w_tile, x_tile, self.heads)
                 d_tile = w_tile.sum(dim=2)  # B, H, M
                 return s_raw_tile, d_tile
 
@@ -172,15 +211,12 @@ class PhysicsAttentionV3(nn.Module):
             d_accum = d_accum + d_t
 
         # Phase 2: Slice-domain operations (on M tokens only)
-        s = self.slice_linear1(s_raw_accum / (d_accum[..., None] + 1e-5))  # B, H, M, dim_head
-
-        q = self.to_q(s)
-        k = self.to_k(s)
-        v = self.to_v(s)
+        s = self.slice_linear1(s_raw_accum / (d_accum[..., None] + 1e-5))
+        q, k, v = self.to_q(s), self.to_k(s), self.to_v(s)
         s_out = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.dropout_p if self.training else 0.0
         )
-        s_out = self.slice_linear3(s_out)  # B, H, M, C
+        s_out = self.slice_linear3(s_out)  # B, H, M, dim_head
 
         # Phase 3: Deslice per tile
         outputs = []
@@ -191,8 +227,9 @@ class PhysicsAttentionV3(nn.Module):
 
             def _tile_deslice(x_tile, s_out_fixed):
                 w_tile = self._compute_slice_weights(x_tile)
-                x_out_tile = torch.einsum("bhmc,bhnm->bhnc", s_out_fixed, w_tile)
-                return x_out_tile.mean(dim=1)  # B, N_t, C
+                # FIX #1 + #2: matmul deslice + rearrange
+                x_out_tile = _deslice(s_out_fixed, w_tile)  # B, H, N_t, dim_head
+                return rearrange(x_out_tile, 'b h n d -> b n (h d)')
 
             if self.training:
                 x_out_t = checkpoint(
@@ -210,17 +247,13 @@ class PhysicsAttentionV3(nn.Module):
 
     @torch.no_grad()
     def compute_physical_state(self, x, num_tiles=0):
-        """Compute cached physical state s'_out from input features.
-
-        Used during the physical state caching phase of inference.
-        Accumulates contributions from all chunks/tiles of the full mesh.
+        """Compute raw physical state accumulators from input features.
 
         Args:
             x: (B, N, C) input features (possibly a chunk of the full mesh)
             num_tiles: tiling for memory efficiency within this chunk
 
         Returns:
-            s_out: (B, H, M, C) cached physical state after attention
             s_raw: (B, H, M, C) raw aggregated features (for accumulation)
             d: (B, H, M) normalization diagonal (for accumulation)
         """
@@ -230,17 +263,16 @@ class PhysicsAttentionV3(nn.Module):
             tile_size = math.ceil(N / num_tiles)
             s_raw = torch.zeros(B, self.heads, self.slice_num, C, device=x.device)
             d = torch.zeros(B, self.heads, self.slice_num, device=x.device)
-
             for t in range(num_tiles):
                 start = t * tile_size
                 end = min(start + tile_size, N)
                 x_t = x[:, start:end]
                 w_t = self._compute_slice_weights(x_t)
-                s_raw = s_raw + torch.einsum("bhnm,bnc->bhmc", w_t, x_t)
+                s_raw = s_raw + _slice_aggregate(w_t, x_t, self.heads)
                 d = d + w_t.sum(dim=2)
         else:
             w = self._compute_slice_weights(x)
-            s_raw = torch.einsum("bhnm,bnc->bhmc", w, x)
+            s_raw = _slice_aggregate(w, x, self.heads)
             d = w.sum(dim=2)
 
         return s_raw, d
@@ -254,12 +286,12 @@ class PhysicsAttentionV3(nn.Module):
             d: (B, H, M) accumulated normalization
 
         Returns:
-            s_out: (B, H, M, C) the cached physical state
+            s_out: (B, H, M, dim_head) the cached physical state
         """
         s = self.slice_linear1(s_raw / (d[..., None] + 1e-5))
         q, k, v = self.to_q(s), self.to_k(s), self.to_v(s)
         s_out = F.scaled_dot_product_attention(q, k, v)
-        s_out = self.slice_linear3(s_out)  # B, H, M, C
+        s_out = self.slice_linear3(s_out)  # B, H, M, dim_head
         return s_out
 
     @torch.no_grad()
@@ -270,12 +302,13 @@ class PhysicsAttentionV3(nn.Module):
 
         Args:
             x_query: (B, N_q, C) query point features
-            cached_s_out: (B, H, M, C) cached physical state from compute_cached_state
+            cached_s_out: (B, H, M, dim_head) cached state
 
         Returns:
             x_out: (B, N_q, C) decoded output
         """
         w = self._compute_slice_weights(x_query)  # B, H, N_q, M
-        x_out = torch.einsum("bhmc,bhnm->bhnc", cached_s_out, w)  # B, H, N_q, C
-        x_out = x_out.mean(dim=1)  # B, N_q, C
+        # FIX #1 + #2: matmul deslice + rearrange
+        x_out = _deslice(cached_s_out, w)  # B, H, N_q, dim_head
+        x_out = rearrange(x_out, 'b h n d -> b n (h d)')  # B, N_q, dim
         return x_out

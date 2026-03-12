@@ -1,10 +1,47 @@
+"""
+Transolver-3 encoder block.
+
+Fix #3: MLP and LayerNorm can be processed in tiles for large N,
+avoiding O(N * hidden * mlp_ratio) peak memory in a single allocation.
+"""
+
+import math
+import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from transolver3.common import MLP
 from transolver3.physics_attention_v3 import PhysicsAttentionV3
 
 
+def _pointwise_chunked(fn, x, chunk_size):
+    """Apply a pointwise function in chunks along dim=1 to limit peak memory.
+
+    Args:
+        fn: callable, e.g. lambda x: mlp(ln(x))
+        x: (B, N, C) input
+        chunk_size: max points per chunk
+
+    Returns:
+        (B, N, C') output
+    """
+    B, N, C = x.shape
+    if chunk_size <= 0 or chunk_size >= N:
+        return fn(x)
+
+    outputs = []
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        outputs.append(fn(x[:, start:end]))
+    return torch.cat(outputs, dim=1)
+
+
 class Transolver3Block(nn.Module):
-    """Transolver-3 encoder block with optimized Physics-Attention."""
+    """Transolver-3 encoder block with optimized Physics-Attention.
+
+    Fix #3: Added mlp_chunk_size parameter. When N exceeds this, MLP and
+    LayerNorm are processed in chunks to avoid O(N * hidden * mlp_ratio)
+    peak memory. Default 0 (no chunking, backward-compatible).
+    """
 
     def __init__(
             self,
@@ -16,9 +53,11 @@ class Transolver3Block(nn.Module):
             last_layer=False,
             out_dim=1,
             slice_num=32,
+            mlp_chunk_size=0,
     ):
         super().__init__()
         self.last_layer = last_layer
+        self.mlp_chunk_size = mlp_chunk_size
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.Attn = PhysicsAttentionV3(
             hidden_dim,
@@ -34,11 +73,21 @@ class Transolver3Block(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Linear(hidden_dim, out_dim)
 
+    def _mlp_residual(self, fx):
+        """LN + MLP residual, possibly chunked for large N."""
+        fn = lambda x: self.mlp(self.ln_2(x))
+        return _pointwise_chunked(fn, fx, self.mlp_chunk_size) + fx
+
+    def _last_layer_head(self, fx):
+        """Final projection, possibly chunked."""
+        fn = lambda x: self.mlp2(self.ln_3(x))
+        return _pointwise_chunked(fn, fx, self.mlp_chunk_size)
+
     def forward(self, fx, num_tiles=0):
         fx = self.Attn(self.ln_1(fx), num_tiles=num_tiles) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        fx = self._mlp_residual(fx)
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            return self._last_layer_head(fx)
         return fx
 
     def compute_physical_state(self, fx):
@@ -58,7 +107,7 @@ class Transolver3Block(nn.Module):
         Paper Eq. 5: uses cached s'_out instead of recomputing attention.
         """
         fx = self.Attn.decode_from_cache(self.ln_1(fx), cached_s_out) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        fx = self._mlp_residual(fx)
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            return self._last_layer_head(fx)
         return fx
