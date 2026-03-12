@@ -107,7 +107,7 @@ def create_scheduler(optimizer, total_steps, warmup_fraction=0.05, min_lr=1e-6):
 
 
 def train_step(model, x, fx, target, optimizer, scheduler, sampler=None,
-               num_tiles=0, grad_clip=1.0):
+               num_tiles=0, tile_size=0, grad_clip=1.0):
     """Single training step with optional geometry amortized training.
 
     Args:
@@ -119,6 +119,8 @@ def train_step(model, x, fx, target, optimizer, scheduler, sampler=None,
         scheduler: LR scheduler
         sampler: AmortizedMeshSampler or None (None = use full mesh)
         num_tiles: number of tiles for attention
+        tile_size: target points per tile (overrides num_tiles if >0).
+                   Paper recommends 100_000 (Table 5).
         grad_clip: gradient clipping norm
 
     Returns:
@@ -130,10 +132,11 @@ def train_step(model, x, fx, target, optimizer, scheduler, sampler=None,
     if sampler is not None:
         N = x.shape[1]
         indices = sampler.sample(N).to(x.device)
-        pred = model(x, fx=fx, num_tiles=num_tiles, subset_indices=indices)
+        pred = model(x, fx=fx, num_tiles=num_tiles, tile_size=tile_size,
+                     subset_indices=indices)
         loss = relative_l2_loss(pred, target[:, indices])
     else:
-        pred = model(x, fx=fx, num_tiles=num_tiles)
+        pred = model(x, fx=fx, num_tiles=num_tiles, tile_size=tile_size)
         loss = relative_l2_loss(pred, target)
 
     loss.backward()
