@@ -166,11 +166,11 @@ Training config (from paper Table 6):
 - Cosine LR schedule with 5% warmup, min lr 1e-6
 - Gradient clipping at 1.0
 
-### Phase 6: Backward Compatibility
+### Phase 6: V1 Code Removal
 
-**Modified: `PDE-Solving-StandardBenchmark/model_dict.py`** — added `'Transolver3'` entry pointing to `transolver3.model.Transolver3`
+Transolver v1 code has been removed. The `timestep_embedding` function (previously imported from `PDE-Solving-StandardBenchmark/model/Embedding.py`) was moved to `transolver3/common.py`.
 
-Existing experiments (`exp_darcy.py`, etc.) can use `--model Transolver3` with `num_tiles=0` (no tiling for small benchmarks). The constructor signature is compatible.
+Removed directories: `PDE-Solving-StandardBenchmark/`, `Airfoil-Design-AirfRANS/`, `Car-Design-ShapeNetCar/`, `Physics_Attention.py`. For v1 reference, see the upstream repo: https://github.com/thuml/Transolver
 
 ---
 
@@ -178,16 +178,18 @@ Existing experiments (`exp_darcy.py`, etc.) can use `--model Transolver3` with `
 
 ```
 Transolver/
-├── transolver3/                          # NEW — core Transolver-3 package
-│   ├── __init__.py                       # Exports Transolver3, CachedInference
-│   ├── common.py                         # MLP, activations
+├── transolver3/                          # Core Transolver-3 package
+│   ├── __init__.py                       # Exports Transolver3, CachedInference, normalizers
+│   ├── common.py                         # MLP, activations, timestep_embedding
 │   ├── physics_attention_v3.py           # Optimized Physics-Attention (core innovation)
 │   ├── transolver3_block.py              # Encoder block with V3 attention
 │   ├── model.py                          # Transolver3 model (train + inference)
-│   ├── amortized_training.py             # Sampler, loss, optimizer, scheduler
-│   └── inference.py                      # CachedInference for industrial-scale
+│   ├── amortized_training.py             # Sampler, loss, optimizer, scheduler, train_step
+│   ├── inference.py                      # CachedInference for industrial-scale
+│   ├── normalizer.py                     # InputNormalizer, TargetNormalizer
+│   └── profiling.py                      # Memory/latency profiling, benchmark_scaling
 │
-├── Industrial-Scale-Benchmarks/          # NEW — industrial benchmark experiments
+├── Industrial-Scale-Benchmarks/          # Industrial benchmark experiments
 │   ├── dataset/
 │   │   ├── nasa_crm.py                   # NASA-CRM dataset (~400K cells)
 │   │   ├── ahmed_ml.py                   # AhmedML dataset (~20M cells)
@@ -199,14 +201,7 @@ Transolver/
 │   └── exp_drivaer_ml.py                 # DrivAerML experiment
 │
 ├── tests/
-│   └── test_transolver3.py               # NEW — 9 tests, all passing
-│
-├── PDE-Solving-StandardBenchmark/
-│   └── model_dict.py                     # MODIFIED — added Transolver3 entry
-│
-├── Physics_Attention.py                  # UNCHANGED — v1 reference
-├── Airfoil-Design-AirfRANS/             # UNCHANGED
-├── Car-Design-ShapeNetCar/              # UNCHANGED
+│   └── test_transolver3.py               # 41 tests, all passing
 └── ...
 ```
 
@@ -214,12 +209,14 @@ Transolver/
 
 ## Key Files Reference
 
-| Existing File | Role |
-|--------------|------|
-| `Physics_Attention.py` | v1 attention — reference for math being optimized |
-| `PDE-Solving-StandardBenchmark/model/Transolver_Irregular_Mesh.py` | v1 block + model — structure replicated |
-| `PDE-Solving-StandardBenchmark/model_dict.py` | Registry updated for backward compat |
-| `PDE-Solving-StandardBenchmark/exp_airfoil.py` | Training loop pattern followed |
+| File | Role |
+|------|------|
+| `transolver3/physics_attention_v3.py` | Core optimized Physics-Attention |
+| `transolver3/model.py` | Full model with tiling, caching, amortized training |
+| `transolver3/amortized_training.py` | Training infrastructure (sampler, loss, scheduler, train_step) |
+| `transolver3/inference.py` | CachedInference for industrial-scale meshes |
+| `transolver3/normalizer.py` | Input (min-max) and target (standardization) normalization |
+| `transolver3/profiling.py` | Memory/latency benchmarking |
 
 ---
 
